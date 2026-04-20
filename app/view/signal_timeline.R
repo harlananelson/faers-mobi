@@ -71,8 +71,10 @@ server <- function(id) {
           arrange(.data$rxnorm_name) %>%
           collect() %>%
           pull(.data$rxnorm_name)
+        # Default to semaglutide — clear GLP-1 class signal in current FAERS
+        default_drug <- if ("semaglutide" %in% drug_choices) "semaglutide" else drug_choices[1]
         updateSelectizeInput(session, "drug", choices = drug_choices,
-                             selected = "rofecoxib", server = TRUE)
+                             selected = default_drug, server = TRUE)
       }
       if (file.exists(EVENT_DICT_PATH)) {
         event_choices <- open_dataset(EVENT_DICT_PATH) %>%
@@ -80,8 +82,9 @@ server <- function(id) {
           arrange(.data$outcome_name) %>%
           collect() %>%
           pull(.data$outcome_name)
+        default_event <- if ("Cholecystitis acute" %in% event_choices) "Cholecystitis acute" else event_choices[1]
         updateSelectizeInput(session, "event", choices = event_choices,
-                             selected = "Myocardial infarction", server = TRUE)
+                             selected = default_event, server = TRUE)
       }
     })
 
