@@ -100,7 +100,7 @@ server <- function(id) {
     output$timeline <- renderPlot({
       ts <- selected_ts()
       if (is.null(ts) || nrow(ts) == 0) {
-        plot.new()
+        graphics::plot.new()
         graphics::text(0.5, 0.5, "No signals found for this pair.", cex = 1.5)
         return()
       }
@@ -118,7 +118,7 @@ server <- function(id) {
       graphics::par(mar = c(4, 5, 3, 2))
       y_max <- max(c(ts$eb95, 3), na.rm = TRUE)
       y_min <- min(c(ts$eb05, 0.5), na.rm = TRUE)
-      plot(
+      graphics::plot(
         ts$quarter_num, ts$eb50,
         type = "n",
         xlim = c(1, nrow(ts)),
