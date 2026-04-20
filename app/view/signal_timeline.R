@@ -8,14 +8,15 @@
 box::use(
   shiny[NS, moduleServer, tagList, selectizeInput, plotOutput, renderPlot,
         req, reactive, tags, div, h4, p, hr, fluidRow, column, withProgress,
-        updateSelectizeInput],
-  arrow[open_dataset],
+        updateSelectizeInput, uiOutput, renderUI, span],
+  arrow[open_dataset, read_parquet],
   dplyr[filter, collect, pull, arrange, distinct, `%>%`, mutate, case_when],
 )
 
 SIGNALS_PATH <- "data/signals.parquet"
 DRUG_DICT_PATH <- "data/drug_dictionary.parquet"
 EVENT_DICT_PATH <- "data/event_dictionary.parquet"
+LABELS_PATH <- "data/fda_labels.parquet"
 
 #' @export
 ui <- function(id) {
@@ -40,13 +41,16 @@ ui <- function(id) {
       column(6, selectizeInput(ns("event"), "Event (MedDRA PT):",
                                 choices = NULL, multiple = FALSE))
     ),
+    fluidRow(column(12, uiOutput(ns("known_badge")))),
     fluidRow(column(12, plotOutput(ns("timeline"), height = "500px"))),
     fluidRow(
       column(12,
         tags$small(tags$em(
           "Disclaimer: disproportionate reporting is a statistical pattern, ",
           "not evidence of causation. Signals are hypotheses requiring further ",
-          "investigation."
+          "investigation. 'Known' means the event appears in the drug's current ",
+          "FDA label; 'Novel' means it does not (label coverage is limited to ",
+          "drugs we have cached openFDA label data for)."
         ))
       )
     )
@@ -98,6 +102,52 @@ server <- function(id) {
                .data$outcome_name == input$event) %>%
         collect() %>%
         arrange(.data$quarter)
+    })
+
+    # FDA label cache (one-time load per session)
+    labels <- reactive({
+      if (!file.exists(LABELS_PATH)) return(NULL)
+      read_parquet(LABELS_PATH)
+    })
+
+    # Known-vs-novel badge: does the event appear in the drug's current label?
+    output$known_badge <- renderUI({
+      req(input$drug, input$event)
+      lbl_df <- labels()
+      if (is.null(lbl_df)) {
+        return(tags$div(class = "alert alert-secondary small py-2",
+                        "Label cross-reference not loaded."))
+      }
+      row <- lbl_df[lbl_df$generic_name == tolower(input$drug), , drop = FALSE]
+      if (nrow(row) == 0 || is.na(row$set_id[1])) {
+        return(tags$div(class = "alert alert-secondary small py-2",
+                        tags$strong("No label cached"),
+                        " for ", tags$em(input$drug), " — can't determine if this signal is known."))
+      }
+      ev <- tolower(input$event)
+      # Check each section; report the most serious hit
+      nz <- function(x) if (is.null(x) || is.na(x)) "" else x
+      sections <- c(
+        Boxed = nz(row$boxed_warning[1]),
+        Contraindications = nz(row$contraindications[1]),
+        `Warnings/Precautions` = paste(nz(row$warnings_and_cautions[1]), nz(row$warnings[1])),
+        `Adverse Reactions` = nz(row$adverse_reactions[1])
+      )
+      hits <- names(sections)[vapply(sections, function(s) grepl(ev, tolower(s), fixed = TRUE), logical(1))]
+      if (length(hits) == 0) {
+        tags$div(class = "alert alert-danger small py-2",
+                 tags$strong("NOVEL"),
+                 " — \"", tags$em(input$event), "\" is not mentioned in ",
+                 tags$em(input$drug), "'s current FDA label. Treat as a hypothesis worth investigating.")
+      } else {
+        priority <- c("Boxed", "Contraindications", "Warnings/Precautions", "Adverse Reactions")
+        top <- priority[priority %in% hits][1]
+        tags$div(class = "alert alert-success small py-2",
+                 tags$strong("KNOWN"),
+                 " — \"", tags$em(input$event), "\" appears in ",
+                 tags$em(input$drug), "'s label (",
+                 paste(hits, collapse = ", "), "). This signal is already documented.")
+      }
     })
 
     output$timeline <- renderPlot({
