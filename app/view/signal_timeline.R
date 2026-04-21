@@ -8,14 +8,12 @@
 box::use(
   shiny[NS, moduleServer, tagList, selectizeInput, plotOutput, renderPlot,
         req, reactive, tags, div, h4, p, hr, fluidRow, column, withProgress,
-        updateSelectizeInput, uiOutput, renderUI, span],
+        updateSelectizeInput, uiOutput, renderUI, span, observeEvent, isolate],
   arrow[open_dataset, read_parquet],
   dplyr[filter, collect, pull, arrange, distinct, `%>%`, mutate, case_when],
 )
 
 SIGNALS_PATH <- "data/signals.parquet"
-DRUG_DICT_PATH <- "data/drug_dictionary.parquet"
-EVENT_DICT_PATH <- "data/event_dictionary.parquet"
 LABELS_PATH <- "data/fda_labels.parquet"
 
 #' @export
@@ -67,30 +65,63 @@ server <- function(id) {
       open_dataset(SIGNALS_PATH)
     })
 
-    # Populate drug/event selects from dictionaries
-    shiny::observe({
-      if (file.exists(DRUG_DICT_PATH)) {
-        drug_choices <- open_dataset(DRUG_DICT_PATH) %>%
-          distinct(.data$rxnorm_name) %>%
-          arrange(.data$rxnorm_name) %>%
-          collect() %>%
-          pull(.data$rxnorm_name)
-        # Default to semaglutide — clear GLP-1 class signal in current FAERS
-        default_drug <- if ("semaglutide" %in% drug_choices) "semaglutide" else drug_choices[1]
-        updateSelectizeInput(session, "drug", choices = drug_choices,
-                             selected = default_drug, server = TRUE)
-      }
-      if (file.exists(EVENT_DICT_PATH)) {
-        event_choices <- open_dataset(EVENT_DICT_PATH) %>%
-          distinct(.data$outcome_name) %>%
-          arrange(.data$outcome_name) %>%
-          collect() %>%
-          pull(.data$outcome_name)
-        default_event <- if ("Cholecystitis acute" %in% event_choices) "Cholecystitis acute" else event_choices[1]
-        updateSelectizeInput(session, "event", choices = event_choices,
-                             selected = default_event, server = TRUE)
-      }
+    # One-shot cache of distinct (drug, event) pairs that actually have signal
+    # rows. Drives both the initial dropdown population and the cross-filter
+    # observers below — users can only pick combinations where data exists.
+    pairs_cache <- reactive({
+      ds <- signals()
+      if (is.null(ds)) return(NULL)
+      ds %>%
+        distinct(.data$rxnorm_name, .data$outcome_name) %>%
+        collect()
     })
+
+    # Initial population: both dropdowns from pairs_cache, defaulting to the
+    # semaglutide / Cholecystitis acute pair (clear GLP-1 signal) when available.
+    shiny::observe({
+      pairs <- pairs_cache()
+      req(pairs)
+      drugs <- sort(unique(pairs$rxnorm_name))
+      events <- sort(unique(pairs$outcome_name))
+      default_drug <- if ("semaglutide" %in% drugs) "semaglutide" else drugs[1]
+      default_event <- if ("Cholecystitis acute" %in% events) "Cholecystitis acute" else events[1]
+      updateSelectizeInput(session, "drug", choices = drugs,
+                           selected = default_drug, server = TRUE)
+      updateSelectizeInput(session, "event", choices = events,
+                           selected = default_event, server = TRUE)
+    })
+
+    # When the drug changes, narrow the event list to events that have a
+    # signal row for the selected drug. Clearing the drug restores the full
+    # list. Keeps the current event selected if still valid.
+    observeEvent(input$drug, {
+      pairs <- pairs_cache()
+      req(pairs)
+      events <- if (is.null(input$drug) || !nzchar(input$drug)) {
+        sort(unique(pairs$outcome_name))
+      } else {
+        pairs %>% filter(.data$rxnorm_name == input$drug) %>%
+          pull(.data$outcome_name) %>% unique() %>% sort()
+      }
+      current_event <- isolate(input$event)
+      keep <- if (!is.null(current_event) && nzchar(current_event) && current_event %in% events) current_event else character(0)
+      updateSelectizeInput(session, "event", choices = events, selected = keep, server = TRUE)
+    }, ignoreInit = TRUE)
+
+    # Symmetric: when the event changes, narrow the drug list.
+    observeEvent(input$event, {
+      pairs <- pairs_cache()
+      req(pairs)
+      drugs <- if (is.null(input$event) || !nzchar(input$event)) {
+        sort(unique(pairs$rxnorm_name))
+      } else {
+        pairs %>% filter(.data$outcome_name == input$event) %>%
+          pull(.data$rxnorm_name) %>% unique() %>% sort()
+      }
+      current_drug <- isolate(input$drug)
+      keep <- if (!is.null(current_drug) && nzchar(current_drug) && current_drug %in% drugs) current_drug else character(0)
+      updateSelectizeInput(session, "drug", choices = drugs, selected = keep, server = TRUE)
+    }, ignoreInit = TRUE)
 
     # Filter signals to selected pair
     selected_ts <- reactive({
