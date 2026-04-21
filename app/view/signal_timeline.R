@@ -257,6 +257,9 @@ server <- function(id) {
         Novel = ifelse(is.na(ps$novel), "?", ifelse(ps$novel, "novel", "known")),
         check.names = FALSE
       )
+      # Default column search: Novel = "novel" and Quarters >= 3. Column
+      # indices (0-based): 0 Drug, 1 Event, 2 Peak EB05, 3 Methods,
+      # 4 Quarters, 5 First signal, 6 Latest signal, 7 Novel.
       datatable(
         display,
         selection = list(mode = "single", selected = .default_row(ps)),
@@ -265,8 +268,14 @@ server <- function(id) {
         options = list(
           pageLength = 25,
           lengthMenu = list(c(10, 25, 50, 100), c("10", "25", "50", "100")),
-          order = list(list(2, "desc")),
+          order = list(list(5, "desc")),
           searchHighlight = TRUE,
+          searchCols = list(
+            NULL, NULL, NULL, NULL,
+            list(search = "3 ... 9999"),
+            NULL, NULL,
+            list(search = "novel")
+          ),
           columnDefs = list(list(className = "dt-right", targets = c(2, 3, 4)))
         )
       ) |>
