@@ -7,10 +7,12 @@
 
 box::use(
   shiny[NS, moduleServer, tagList, selectizeInput, plotOutput, renderPlot,
-        req, reactive, tags, div, h4, p, hr, fluidRow, column, withProgress,
-        updateSelectizeInput, uiOutput, renderUI, span, observeEvent, isolate],
+        req, reactive, reactiveVal, tags, div, h4, p, hr, fluidRow, column,
+        withProgress, updateSelectizeInput, uiOutput, renderUI, span,
+        observeEvent, isolate, tableOutput, renderTable],
   arrow[open_dataset, read_parquet],
-  dplyr[filter, collect, pull, arrange, distinct, `%>%`, mutate, case_when],
+  dplyr[filter, collect, pull, arrange, distinct, `%>%`, mutate, case_when,
+        group_by, summarise, desc],
 )
 
 SIGNALS_PATH <- "data/signals.parquet"
@@ -30,6 +32,18 @@ ui <- function(id) {
           "estimate overlaid. Threshold lines mark EBGM = 1 (null) and ",
           "EBGM = 2 (FDA signal criterion)."
         ),
+        hr()
+      )
+    ),
+    fluidRow(
+      column(12,
+        h4("Top 20 novel signals — not in FDA label"),
+        p("Computed across all pairs flagged by \u22653 of 4 methods, ranked by ",
+          "peak EWMA-smoothed EB05. \u201CNovel\u201D means the event is not ",
+          "mentioned in the drug\u2019s current FDA label (limited to drugs ",
+          "with cached openFDA label data). These are hypotheses worth ",
+          "investigating, not confirmed associations."),
+        tableOutput(ns("top_novel_table")),
         hr()
       )
     ),
@@ -91,10 +105,21 @@ server <- function(id) {
                            selected = default_event, server = TRUE)
     })
 
+    # Flags to break the cross-filter loop. When an observer programmatically
+    # updates the other select, it sets the partner's skip flag. The partner
+    # observer fires (because updateSelectizeInput re-emits the input),
+    # consumes the flag, and returns without running the filter.
+    skip_next_drug <- reactiveVal(FALSE)
+    skip_next_event <- reactiveVal(FALSE)
+
     # When the drug changes, narrow the event list to events that have a
     # signal row for the selected drug. Clearing the drug restores the full
     # list. Keeps the current event selected if still valid.
     observeEvent(input$drug, {
+      if (isolate(skip_next_drug())) {
+        skip_next_drug(FALSE)
+        return()
+      }
       pairs <- pairs_cache()
       req(pairs)
       events <- if (is.null(input$drug) || !nzchar(input$drug)) {
@@ -105,11 +130,16 @@ server <- function(id) {
       }
       current_event <- isolate(input$event)
       keep <- if (!is.null(current_event) && nzchar(current_event) && current_event %in% events) current_event else character(0)
+      skip_next_event(TRUE)
       updateSelectizeInput(session, "event", choices = events, selected = keep, server = TRUE)
     }, ignoreInit = TRUE)
 
     # Symmetric: when the event changes, narrow the drug list.
     observeEvent(input$event, {
+      if (isolate(skip_next_event())) {
+        skip_next_event(FALSE)
+        return()
+      }
       pairs <- pairs_cache()
       req(pairs)
       drugs <- if (is.null(input$event) || !nzchar(input$event)) {
@@ -120,6 +150,7 @@ server <- function(id) {
       }
       current_drug <- isolate(input$drug)
       keep <- if (!is.null(current_drug) && nzchar(current_drug) && current_drug %in% drugs) current_drug else character(0)
+      skip_next_drug(TRUE)
       updateSelectizeInput(session, "drug", choices = drugs, selected = keep, server = TRUE)
     }, ignoreInit = TRUE)
 
@@ -134,6 +165,57 @@ server <- function(id) {
         collect() %>%
         arrange(.data$quarter)
     })
+
+    # Top 20 pairs flagged by >=3 of 4 methods whose event is NOT mentioned
+    # in the drug's current FDA label. Computed once per session.
+    top_novel <- reactive({
+      ds <- signals()
+      lbl <- labels()
+      req(ds, lbl)
+      top <- ds %>%
+        filter(.data$n_methods_flagged >= 3) %>%
+        group_by(.data$rxnorm_name, .data$outcome_name) %>%
+        summarise(
+          peak_eb05 = max(.data$ewma_eb05, na.rm = TRUE),
+          n_methods_max = max(.data$n_methods_flagged, na.rm = TRUE),
+          quarters_flagged = sum(.data$is_signal_any, na.rm = TRUE),
+          .groups = "drop"
+        ) %>%
+        arrange(desc(.data$peak_eb05)) %>%
+        utils::head(200) %>%
+        collect()
+      top$is_novel <- mapply(function(drug, event) {
+        row <- lbl[lbl$generic_name == tolower(drug), , drop = FALSE]
+        if (nrow(row) == 0 || is.na(row$set_id[1])) return(NA)
+        ev <- tolower(event)
+        sections <- c(
+          row$boxed_warning[1], row$contraindications[1],
+          row$warnings_and_cautions[1], row$warnings[1], row$adverse_reactions[1]
+        )
+        sections[is.na(sections)] <- ""
+        !any(grepl(ev, tolower(sections), fixed = TRUE))
+      }, top$rxnorm_name, top$outcome_name)
+      top <- top[!is.na(top$is_novel) & top$is_novel, , drop = FALSE]
+      top$is_novel <- NULL
+      utils::head(top, 20)
+    })
+
+    output$top_novel_table <- renderTable({
+      tn <- top_novel()
+      req(tn)
+      if (nrow(tn) == 0) {
+        return(data.frame(Message = "No novel signals at current criteria."))
+      }
+      out <- data.frame(
+        Drug = tn$rxnorm_name,
+        Event = tn$outcome_name,
+        `Peak EB05` = round(tn$peak_eb05, 2),
+        `Methods (max of 4)` = as.integer(tn$n_methods_max),
+        `Quarters flagged` = as.integer(tn$quarters_flagged),
+        check.names = FALSE
+      )
+      out
+    }, digits = 2, striped = TRUE, hover = TRUE, spacing = "s")
 
     # FDA label cache (one-time load per session)
     labels <- reactive({
