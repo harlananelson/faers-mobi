@@ -157,6 +157,10 @@ server <- function(id) {
       # them blocks the page for minutes. The top 2000 covers the entire
       # clinically interesting range (weakest kept peak_eb05 will be far
       # below the signal threshold of 2).
+      # Rows in signals where n_methods_flagged >= 2 are all signal-positive
+      # by construction (is_signal_any requires >= 1 method). So the minimum
+      # quarter over the filtered rows is the first quarter this pair was
+      # flagged at the 2+ criterion — a useful "first signal" date.
       ps <- ds %>%
         filter(.data$n_methods_flagged >= 2) %>%
         group_by(.data$rxnorm_name, .data$outcome_name) %>%
@@ -164,6 +168,8 @@ server <- function(id) {
           peak_eb05 = max(.data$ewma_eb05, na.rm = TRUE),
           n_methods_max = max(.data$n_methods_flagged, na.rm = TRUE),
           quarters_flagged = sum(.data$is_signal_any, na.rm = TRUE),
+          first_signal = min(.data$quarter, na.rm = TRUE),
+          latest_signal = max(.data$quarter, na.rm = TRUE),
           .groups = "drop"
         ) %>%
         arrange(desc(.data$peak_eb05)) %>%
@@ -210,6 +216,8 @@ server <- function(id) {
         `Peak EB05` = round(ps$peak_eb05, 2),
         Methods = as.integer(ps$n_methods_max),
         Quarters = as.integer(ps$quarters_flagged),
+        `First signal` = ps$first_signal,
+        `Latest signal` = ps$latest_signal,
         Novel = ifelse(is.na(ps$novel), "?", ifelse(ps$novel, "novel", "known")),
         check.names = FALSE
       )
