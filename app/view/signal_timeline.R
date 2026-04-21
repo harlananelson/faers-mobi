@@ -1,18 +1,20 @@
-# Signal Timeline — caterpillar plot of credible intervals over time for a
-# single (drug, event) pair.
+# Signal Timeline — searchable / sortable DataTable of all signal-bearing
+# (drug, event) pairs. Clicking a row renders a caterpillar plot of the
+# credible intervals over time for that pair, plus a KNOWN/NOVEL badge
+# against the drug's current FDA label.
 #
-# Reads precomputed signals from /srv/shiny-server/faers-mobi/data/signals.parquet
-# (produced offline by signal-compute). Never calls safetysignal live — all
-# signals are precomputed on the local GPU box.
+# Reads precomputed signals from data/signals.parquet (produced offline by
+# signal-compute). Never calls safetysignal live — all signals are
+# precomputed on the local GPU box.
 
 box::use(
-  shiny[NS, moduleServer, tagList, selectizeInput, plotOutput, renderPlot,
+  shiny[NS, moduleServer, tagList, plotOutput, renderPlot,
         req, reactive, reactiveVal, tags, div, h4, p, hr, fluidRow, column,
-        withProgress, updateSelectizeInput, uiOutput, renderUI, span,
-        observeEvent, isolate, tableOutput, renderTable],
+        uiOutput, renderUI, span, observeEvent, isolate],
   arrow[open_dataset, read_parquet],
-  dplyr[filter, collect, pull, arrange, distinct, `%>%`, mutate, case_when,
+  dplyr[filter, collect, pull, arrange, `%>%`, mutate, case_when,
         group_by, summarise, desc],
+  DT[datatable, dataTableOutput, renderDataTable, formatRound, formatStyle, styleEqual],
 )
 
 SIGNALS_PATH <- "data/signals.parquet"
@@ -76,38 +78,27 @@ ui <- function(id) {
   tagList(
     fluidRow(
       column(12,
-        h4("Signal credible intervals over time"),
+        h4("Signals by drug and event"),
         p(
-          "Pick a drug and an adverse event. The caterpillar plot shows the ",
-          "95% credible interval (EB05–EB95) of the Bayesian Gamma-Poisson ",
-          "relative reporting rate per quarter, with the EWMA-smoothed point ",
-          "estimate overlaid. Threshold lines mark EBGM = 1 (null) and ",
-          "EBGM = 2 (FDA signal criterion)."
+          "Every (drug, event) pair flagged by \u22652 of 4 disproportionality ",
+          "methods (GPS/EBGM, PRR, ROR, IC) is listed below. The table is ",
+          "searchable, sortable, and paginated \u2014 default sort is Peak EB05 ",
+          "descending, so the strongest Bayesian signals are at the top. ",
+          "Click any row to see the time-course plot and the label cross-check."
         ),
-        hr()
-      )
-    ),
-    fluidRow(
-      column(12,
-        h4("Top 20 pairs not in cached FDA label"),
-        p("Pairs flagged by \u22653 of 4 methods, ranked by peak EWMA-smoothed ",
-          "EB05. \u201CNot in cached label\u201D means the event (or \u226570% of ",
-          "its words) is absent from the drug\u2019s boxed warning, ",
-          "contraindications, warnings, or adverse-reactions sections in our ",
-          "openFDA label cache. Medication-error and product-quality PTs are ",
-          "filtered out. This is a weak novelty proxy: class effects, ",
-          "MedDRA-hierarchy synonyms, and indication confounders are NOT ",
-          "excluded here \u2014 treat rows as hypotheses to investigate, not ",
+        p(tags$strong("Novel column:"),
+          " \u201Cnovel\u201D = event (or \u226570% of its words) is absent from the ",
+          "drug\u2019s boxed warning, contraindications, warnings, adverse ",
+          "reactions, and (when cached) indications sections. Medication-error ",
+          "and product-quality PTs are hidden. This is still a weak novelty ",
+          "proxy \u2014 class effects and MedDRA-hierarchy synonyms are NOT ",
+          "excluded. Treat novel rows as hypotheses to investigate, not ",
           "confirmed novel associations."),
-        tableOutput(ns("top_novel_table")),
         hr()
       )
     ),
     fluidRow(
-      column(6, selectizeInput(ns("drug"), "Drug (RxNorm):",
-                                choices = NULL, multiple = FALSE)),
-      column(6, selectizeInput(ns("event"), "Event (MedDRA PT):",
-                                choices = NULL, multiple = FALSE))
+      column(12, dataTableOutput(ns("signal_table")))
     ),
     fluidRow(column(12, uiOutput(ns("known_badge")))),
     fluidRow(column(12, plotOutput(ns("timeline"), height = "500px"))),
@@ -135,101 +126,22 @@ server <- function(id) {
       open_dataset(SIGNALS_PATH)
     })
 
-    # One-shot cache of distinct (drug, event) pairs that actually have signal
-    # rows. Drives both the initial dropdown population and the cross-filter
-    # observers below — users can only pick combinations where data exists.
-    pairs_cache <- reactive({
-      ds <- signals()
-      if (is.null(ds)) return(NULL)
-      ds %>%
-        distinct(.data$rxnorm_name, .data$outcome_name) %>%
-        collect()
+    # FDA label cache (one-time load per session)
+    labels <- reactive({
+      if (!file.exists(LABELS_PATH)) return(NULL)
+      read_parquet(LABELS_PATH)
     })
 
-    # Initial population: both dropdowns from pairs_cache, defaulting to the
-    # semaglutide / Cholecystitis acute pair (clear GLP-1 signal) when available.
-    shiny::observe({
-      pairs <- pairs_cache()
-      req(pairs)
-      drugs <- sort(unique(pairs$rxnorm_name))
-      events <- sort(unique(pairs$outcome_name))
-      default_drug <- if ("semaglutide" %in% drugs) "semaglutide" else drugs[1]
-      default_event <- if ("Cholecystitis acute" %in% events) "Cholecystitis acute" else events[1]
-      updateSelectizeInput(session, "drug", choices = drugs,
-                           selected = default_drug, server = TRUE)
-      updateSelectizeInput(session, "event", choices = events,
-                           selected = default_event, server = TRUE)
-    })
-
-    # Flags to break the cross-filter loop. When an observer programmatically
-    # updates the other select, it sets the partner's skip flag. The partner
-    # observer fires (because updateSelectizeInput re-emits the input),
-    # consumes the flag, and returns without running the filter.
-    skip_next_drug <- reactiveVal(FALSE)
-    skip_next_event <- reactiveVal(FALSE)
-
-    # When the drug changes, narrow the event list to events that have a
-    # signal row for the selected drug. Clearing the drug restores the full
-    # list. Keeps the current event selected if still valid.
-    observeEvent(input$drug, {
-      if (isolate(skip_next_drug())) {
-        skip_next_drug(FALSE)
-        return()
-      }
-      pairs <- pairs_cache()
-      req(pairs)
-      events <- if (is.null(input$drug) || !nzchar(input$drug)) {
-        sort(unique(pairs$outcome_name))
-      } else {
-        pairs %>% filter(.data$rxnorm_name == input$drug) %>%
-          pull(.data$outcome_name) %>% unique() %>% sort()
-      }
-      current_event <- isolate(input$event)
-      keep <- if (!is.null(current_event) && nzchar(current_event) && current_event %in% events) current_event else character(0)
-      skip_next_event(TRUE)
-      updateSelectizeInput(session, "event", choices = events, selected = keep, server = TRUE)
-    }, ignoreInit = TRUE)
-
-    # Symmetric: when the event changes, narrow the drug list.
-    observeEvent(input$event, {
-      if (isolate(skip_next_event())) {
-        skip_next_event(FALSE)
-        return()
-      }
-      pairs <- pairs_cache()
-      req(pairs)
-      drugs <- if (is.null(input$event) || !nzchar(input$event)) {
-        sort(unique(pairs$rxnorm_name))
-      } else {
-        pairs %>% filter(.data$outcome_name == input$event) %>%
-          pull(.data$rxnorm_name) %>% unique() %>% sort()
-      }
-      current_drug <- isolate(input$drug)
-      keep <- if (!is.null(current_drug) && nzchar(current_drug) && current_drug %in% drugs) current_drug else character(0)
-      skip_next_drug(TRUE)
-      updateSelectizeInput(session, "drug", choices = drugs, selected = keep, server = TRUE)
-    }, ignoreInit = TRUE)
-
-    # Filter signals to selected pair
-    selected_ts <- reactive({
-      ds <- signals()
-      req(ds)
-      req(input$drug, input$event)
-      ds %>%
-        filter(.data$rxnorm_name == input$drug,
-               .data$outcome_name == input$event) %>%
-        collect() %>%
-        arrange(.data$quarter)
-    })
-
-    # Top 20 pairs flagged by >=3 of 4 methods whose event is NOT mentioned
-    # in the drug's current FDA label. Computed once per session.
-    top_novel <- reactive({
+    # One-shot aggregation of every (drug, event) pair flagged by >=2 of 4
+    # methods, with peak EWMA-smoothed EB05 and novelty flag. Used by the
+    # datatable. Computed once per session (reactives cache).
+    pair_stats <- reactive({
       ds <- signals()
       lbl <- labels()
-      req(ds, lbl)
-      top <- ds %>%
-        filter(.data$n_methods_flagged >= 3) %>%
+      req(ds)
+      # Aggregate on the arrow side — cheap, no full materialisation
+      ps <- ds %>%
+        filter(.data$n_methods_flagged >= 2) %>%
         group_by(.data$rxnorm_name, .data$outcome_name) %>%
         summarise(
           peak_eb05 = max(.data$ewma_eb05, na.rm = TRUE),
@@ -238,71 +150,110 @@ server <- function(id) {
           .groups = "drop"
         ) %>%
         arrange(desc(.data$peak_eb05)) %>%
-        utils::head(400) %>%
         collect()
       # Drop medication-error / admin / product-quality PTs — not drug effects
-      top <- top[!vapply(top$outcome_name, .event_is_blacklisted, logical(1)), , drop = FALSE]
-      # Label check: novel if event (or >=70% of its words) is absent from any
-      # label section we cache. Requires a cached label; unknowns drop out.
-      # If indications_and_usage is available (augmented cache), it's included
-      # so indication confounders (drug -> its own indication) are filtered.
-      has_indications <- "indications_and_usage" %in% names(lbl)
-      top$is_novel <- mapply(function(drug, event) {
-        row <- lbl[lbl$generic_name == tolower(drug), , drop = FALSE]
-        if (nrow(row) == 0 || is.na(row$set_id[1])) return(NA)
-        sections <- c(
-          row$boxed_warning[1], row$contraindications[1],
-          row$warnings_and_cautions[1], row$warnings[1], row$adverse_reactions[1]
-        )
-        if (has_indications) sections <- c(sections, row$indications_and_usage[1])
-        sections[is.na(sections)] <- ""
-        combined <- paste(sections, collapse = " \n ")
-        !.event_in_label(event, combined)
-      }, top$rxnorm_name, top$outcome_name)
-      top <- top[!is.na(top$is_novel) & top$is_novel, , drop = FALSE]
-      top$is_novel <- NULL
-      utils::head(top, 20)
+      ps <- ps[!vapply(ps$outcome_name, .event_is_blacklisted, logical(1)), , drop = FALSE]
+      # Novelty column: TRUE (novel), FALSE (known), NA (no cached label)
+      if (is.null(lbl)) {
+        ps$novel <- NA
+      } else {
+        has_indications <- "indications_and_usage" %in% names(lbl)
+        ps$novel <- mapply(function(drug, event) {
+          row <- lbl[lbl$generic_name == tolower(drug), , drop = FALSE]
+          if (nrow(row) == 0 || is.na(row$set_id[1])) return(NA)
+          sections <- c(
+            row$boxed_warning[1], row$contraindications[1],
+            row$warnings_and_cautions[1], row$warnings[1], row$adverse_reactions[1]
+          )
+          if (has_indications) sections <- c(sections, row$indications_and_usage[1])
+          sections[is.na(sections)] <- ""
+          combined <- paste(sections, collapse = " \n ")
+          !.event_in_label(event, combined)
+        }, ps$rxnorm_name, ps$outcome_name)
+      }
+      ps
     })
 
-    output$top_novel_table <- renderTable({
-      tn <- top_novel()
-      req(tn)
-      if (nrow(tn) == 0) {
-        return(data.frame(Message = "No novel signals at current criteria."))
-      }
-      out <- data.frame(
-        Drug = tn$rxnorm_name,
-        Event = tn$outcome_name,
-        `Peak EB05` = round(tn$peak_eb05, 2),
-        `Methods (max of 4)` = as.integer(tn$n_methods_max),
-        `Quarters flagged` = as.integer(tn$quarters_flagged),
+    # Pick a reasonable default row so the plot has something to render on
+    # first load. Falls back to row 1 if the preferred pair isn't present.
+    .default_row <- function(ps) {
+      preferred <- which(ps$rxnorm_name == "semaglutide" &
+                         ps$outcome_name == "Cholecystitis acute")
+      if (length(preferred) == 1) return(preferred)
+      1L
+    }
+
+    output$signal_table <- renderDataTable({
+      ps <- pair_stats()
+      req(ps)
+      display <- data.frame(
+        Drug = ps$rxnorm_name,
+        Event = ps$outcome_name,
+        `Peak EB05` = round(ps$peak_eb05, 2),
+        Methods = as.integer(ps$n_methods_max),
+        Quarters = as.integer(ps$quarters_flagged),
+        Novel = ifelse(is.na(ps$novel), "?", ifelse(ps$novel, "novel", "known")),
         check.names = FALSE
       )
-      out
-    }, digits = 2, striped = TRUE, hover = TRUE, spacing = "s")
+      datatable(
+        display,
+        selection = list(mode = "single", selected = .default_row(ps)),
+        rownames = FALSE,
+        filter = "top",
+        options = list(
+          pageLength = 25,
+          lengthMenu = list(c(10, 25, 50, 100), c("10", "25", "50", "100")),
+          order = list(list(2, "desc")),
+          searchHighlight = TRUE,
+          columnDefs = list(list(className = "dt-right", targets = c(2, 3, 4)))
+        )
+      ) |>
+        formatStyle(
+          "Novel",
+          backgroundColor = styleEqual(
+            c("novel", "known", "?"),
+            c("#ffe8e8", "#e8f5e8", "#f0f0f0")
+          )
+        )
+    })
 
-    # FDA label cache (one-time load per session)
-    labels <- reactive({
-      if (!file.exists(LABELS_PATH)) return(NULL)
-      read_parquet(LABELS_PATH)
+    # Which (drug, event) the user has selected from the table. Starts from
+    # the default row pre-selected by renderDataTable above.
+    selected_pair <- reactive({
+      ps <- pair_stats()
+      req(ps)
+      i <- input$signal_table_rows_selected
+      if (is.null(i) || length(i) == 0) i <- .default_row(ps)
+      list(drug = ps$rxnorm_name[i], event = ps$outcome_name[i])
+    })
+
+    # Filter signals to selected pair for plotting
+    selected_ts <- reactive({
+      ds <- signals()
+      sp <- selected_pair()
+      req(ds, sp$drug, sp$event)
+      ds %>%
+        filter(.data$rxnorm_name == sp$drug,
+               .data$outcome_name == sp$event) %>%
+        collect() %>%
+        arrange(.data$quarter)
     })
 
     # Known-vs-novel badge: does the event appear in the drug's current label?
     output$known_badge <- renderUI({
-      req(input$drug, input$event)
+      sp <- selected_pair()
+      req(sp$drug, sp$event)
       lbl_df <- labels()
       if (is.null(lbl_df)) {
         return(tags$div(class = "alert alert-secondary small py-2",
                         "Label cross-reference not loaded."))
       }
-      row <- lbl_df[lbl_df$generic_name == tolower(input$drug), , drop = FALSE]
+      row <- lbl_df[lbl_df$generic_name == tolower(sp$drug), , drop = FALSE]
       if (nrow(row) == 0 || is.na(row$set_id[1])) {
         return(tags$div(class = "alert alert-secondary small py-2",
                         tags$strong("No label cached"),
-                        " for ", tags$em(input$drug), " — can't determine if this signal is known."))
+                        " for ", tags$em(sp$drug), " \u2014 can't determine if this signal is known."))
       }
-      ev <- tolower(input$event)
-      # Check each section; report the most serious hit
       nz <- function(x) if (is.null(x) || is.na(x)) "" else x
       sections <- c(
         Boxed = nz(row$boxed_warning[1]),
@@ -310,32 +261,32 @@ server <- function(id) {
         `Warnings/Precautions` = paste(nz(row$warnings_and_cautions[1]), nz(row$warnings[1])),
         `Adverse Reactions` = nz(row$adverse_reactions[1])
       )
-      hits <- names(sections)[vapply(sections, function(s) .event_in_label(input$event, s), logical(1))]
+      hits <- names(sections)[vapply(sections, function(s) .event_in_label(sp$event, s), logical(1))]
       if (length(hits) == 0) {
         tags$div(class = "alert alert-danger small py-2",
                  tags$strong("NOVEL"),
-                 " — \"", tags$em(input$event), "\" is not mentioned in ",
-                 tags$em(input$drug), "'s current FDA label. Treat as a hypothesis worth investigating.")
+                 " \u2014 \"", tags$em(sp$event), "\" is not mentioned in ",
+                 tags$em(sp$drug), "'s current FDA label. Treat as a hypothesis worth investigating.")
       } else {
         priority <- c("Boxed", "Contraindications", "Warnings/Precautions", "Adverse Reactions")
         top <- priority[priority %in% hits][1]
         tags$div(class = "alert alert-success small py-2",
                  tags$strong("KNOWN"),
-                 " — \"", tags$em(input$event), "\" appears in ",
-                 tags$em(input$drug), "'s label (",
+                 " \u2014 \"", tags$em(sp$event), "\" appears in ",
+                 tags$em(sp$drug), "'s label (",
                  paste(hits, collapse = ", "), "). This signal is already documented.")
       }
     })
 
     output$timeline <- renderPlot({
       ts <- selected_ts()
+      sp <- selected_pair()
       if (is.null(ts) || nrow(ts) == 0) {
         graphics::plot.new()
         graphics::text(0.5, 0.5, "No signals found for this pair.", cex = 1.5)
         return()
       }
 
-      # Build caterpillar plot with base graphics + polygon for the ribbon
       ts <- mutate(ts,
         quarter_num = seq_along(.data$quarter),
         signal_tier = case_when(
@@ -356,29 +307,24 @@ server <- function(id) {
         xaxt = "n",
         xlab = "Quarter",
         ylab = "Bayesian RR (EBGM with 95% CI)",
-        main = paste0(input$drug, " + ", input$event),
+        main = paste0(sp$drug, " + ", sp$event),
         log = "y"
       )
-      # Axis: quarter labels (every 4th or so to avoid clutter)
       step <- max(1, floor(nrow(ts) / 10))
       idx <- seq(1, nrow(ts), step)
       graphics::axis(1, at = idx, labels = ts$quarter[idx], las = 2, cex.axis = 0.8)
 
-      # Reference lines
       graphics::abline(h = 1, col = "gray60", lty = 2)
       graphics::abline(h = 2, col = "firebrick", lty = 3)
 
-      # Error bars (EB05 — EB95)
       graphics::segments(
         x0 = ts$quarter_num, y0 = ts$eb05,
         x1 = ts$quarter_num, y1 = ts$eb95,
         col = "steelblue", lwd = 2
       )
-      # Point estimate
       color <- ifelse(ts$signal_tier == "signal", "firebrick",
                      ifelse(ts$signal_tier == "watch", "orange2", "steelblue"))
       graphics::points(ts$quarter_num, ts$eb50, pch = 19, col = color)
-      # EWMA smoothed (if present)
       if ("ewma_eb05" %in% names(ts)) {
         graphics::lines(ts$quarter_num, ts$ewma_eb05, col = "darkgreen", lty = 1, lwd = 2)
       }
