@@ -281,8 +281,16 @@ server <- function(id) {
     output$signal_table <- renderDataTable({
       ps <- pair_stats()
       req(ps)
+      # Drug label: show "brand (ingredient)" when DiAna resolved them to
+      # different strings, else just the raw name. Lets users see both the
+      # name they know and the canonical active ingredient.
+      drug_col <- ifelse(
+        !is.na(ps$substance) & tolower(ps$rxnorm_name) != ps$substance,
+        paste0(ps$rxnorm_name, " (", ps$substance, ")"),
+        ps$rxnorm_name
+      )
       display <- data.frame(
-        Drug = ps$rxnorm_name,
+        Drug = drug_col,
         Event = ps$outcome_name,
         `Peak EB05` = round(ps$peak_eb05, 2),
         `Adj EB05` = round(ps$adj_eb05, 2),
