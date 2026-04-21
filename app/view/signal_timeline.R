@@ -21,6 +21,7 @@ SIGNALS_PATH <- "data/signals.parquet"
 LABELS_PATH <- "data/fda_labels.parquet"
 DIANA_PATH <- "data/diana_dictionary.parquet"
 FIRST_APPROVAL_PATH <- "data/first_approval.parquet"
+MEDDRA_PATH <- "data/meddra_hierarchy.parquet"
 
 # ---- Novelty filter support ----
 # Events that are medication errors, product-quality issues, or administrative
@@ -72,6 +73,21 @@ EVENT_BLACKLIST_PATTERNS <- c(
   ev <- tolower(event)
   any(vapply(EVENT_BLACKLIST_PATTERNS,
              function(p) grepl(p, ev, ignore.case = TRUE), logical(1)))
+}
+
+# Expanded in-label check: returns TRUE if the event, any of its
+# non-trivial word-stems, OR any MedDRA hierarchy synonym (via UMLS CUI)
+# is present in the label text. Covers cases where the label describes
+# the same concept with non-MedDRA wording (e.g. PT "Spinal cord
+# infarction" vs label "spinal cord ischaemia").
+.event_in_label_expanded <- function(event, label_text, meddra_row = NULL) {
+  if (.event_in_label(event, label_text)) return(TRUE)
+  if (is.null(meddra_row) || nrow(meddra_row) == 0) return(FALSE)
+  syns <- meddra_row$syns_list[[1]]
+  syns <- syns[nchar(syns) >= 5]
+  if (length(syns) == 0) return(FALSE)
+  lbl <- tolower(label_text)
+  any(vapply(syns, function(s) grepl(s, lbl, fixed = TRUE), logical(1)))
 }
 
 # Resolve a raw drug name to an active-substance name using the DiAna
@@ -169,6 +185,17 @@ server <- function(id) {
       read_parquet(FIRST_APPROVAL_PATH)
     })
 
+    # MedDRA PT hierarchy via UMLS: for each top-signal PT we cache its
+    # CUI and all same-CUI synonyms across vocabularies. Used by the
+    # Novel check so that label text using non-MedDRA wording still
+    # resolves to "known".
+    meddra <- reactive({
+      if (!file.exists(MEDDRA_PATH)) return(NULL)
+      df <- read_parquet(MEDDRA_PATH)
+      df$syns_list <- strsplit(df$synonyms, ";", fixed = TRUE)
+      df
+    })
+
     # FDA label cache, augmented with a `substance` column derived from
     # DiAna: tries generic_name first, then brand_name. Lets both the
     # pair_stats novelty check and the KNOWN/NOVEL badge match signal
@@ -253,6 +280,7 @@ server <- function(id) {
         ps$novel <- NA
       } else {
         has_indications <- "indications_and_usage" %in% names(lbl)
+        mh <- meddra()
         ps$novel <- mapply(function(drug, event) {
           row <- .find_label_row(lbl, drug, diana)
           if (nrow(row) == 0 || is.na(row$set_id[1])) return(NA)
@@ -263,7 +291,8 @@ server <- function(id) {
           if (has_indications) sections <- c(sections, row$indications_and_usage[1])
           sections[is.na(sections)] <- ""
           combined <- paste(sections, collapse = " \n ")
-          !.event_in_label(event, combined)
+          mrow <- if (!is.null(mh)) mh[mh$pt == event, , drop = FALSE] else NULL
+          !.event_in_label_expanded(event, combined, mrow)
         }, ps$rxnorm_name, ps$outcome_name)
       }
       ps
