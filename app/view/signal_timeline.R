@@ -72,6 +72,17 @@ EVENT_BLACKLIST_PATTERNS <- c(
              function(p) grepl(p, ev, ignore.case = TRUE), logical(1)))
 }
 
+# Find the label row for a drug name, checking generic_name AND brand_name
+# (both lowercased). The signals' rxnorm_name often carries brand names
+# (e.g. "ampyra") while the label cache's generic_name is the active
+# ingredient ("dalfampridine"); matching brand_name catches those.
+.find_label_row <- function(lbl, drug) {
+  drug_lc <- tolower(drug)
+  lbl[tolower(lbl$generic_name) == drug_lc |
+        (!is.na(lbl$brand_name) & tolower(lbl$brand_name) == drug_lc),
+      , drop = FALSE]
+}
+
 #' @export
 ui <- function(id) {
   ns <- NS(id)
@@ -166,7 +177,7 @@ server <- function(id) {
       } else {
         has_indications <- "indications_and_usage" %in% names(lbl)
         ps$novel <- mapply(function(drug, event) {
-          row <- lbl[lbl$generic_name == tolower(drug), , drop = FALSE]
+          row <- .find_label_row(lbl, drug)
           if (nrow(row) == 0 || is.na(row$set_id[1])) return(NA)
           sections <- c(
             row$boxed_warning[1], row$contraindications[1],
@@ -255,7 +266,7 @@ server <- function(id) {
         return(tags$div(class = "alert alert-secondary small py-2",
                         "Label cross-reference not loaded."))
       }
-      row <- lbl_df[lbl_df$generic_name == tolower(sp$drug), , drop = FALSE]
+      row <- .find_label_row(lbl_df, sp$drug)
       if (nrow(row) == 0 || is.na(row$set_id[1])) {
         return(tags$div(class = "alert alert-secondary small py-2",
                         tags$strong("No label cached"),
