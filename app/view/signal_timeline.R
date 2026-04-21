@@ -45,11 +45,33 @@ EVENT_BLACKLIST_EXACT <- c(
   "Accidental overdose",
   "Off label use",
   "Drug abuse",
-  "Drug dependence"
+  "Drug dependence",
+  # Added 2026-04-21 from top-20 novel audit (AI/reviews/top20-novel-verification.md).
+  # These are all MedDRA SOC "Product issues" or medication-error PTs dressed
+  # as AEs — not drug pharmacology.
+  "Product contamination",
+  "Product contamination physical",
+  "Product contamination microbial",
+  "Product contamination chemical",
+  "Product cleaning inadequate",
+  "Product residue present",
+  "Product deposit",
+  "Labelled drug-disease interaction medication error",
+  "Product physical issue",
+  "Injection site extravasation"
 )
 EVENT_BLACKLIST_PATTERNS <- c(
   "dispensing error", "administration error", "product.*error",
-  "product use issue", "drug use error", "medication interaction"
+  "product use issue", "drug use error", "medication interaction",
+  # Broaden: any PT starting with "product " is SOC Product issues
+  "^product ",
+  # Any PT ending in " medication error" or " dispensing error"
+  "medication error$",
+  # Drug-disease interaction errors
+  "drug-disease interaction",
+  # Drug preparation / storage / administration issues
+  "drug preparation error",
+  "product storage error"
 )
 
 .EVENT_STOP_WORDS <- c(
