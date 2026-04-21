@@ -19,6 +19,7 @@ box::use(
 
 SIGNALS_PATH <- "data/signals.parquet"
 LABELS_PATH <- "data/fda_labels.parquet"
+DIANA_PATH <- "data/diana_dictionary.parquet"
 
 # ---- Novelty filter support ----
 # Events that are medication errors, product-quality issues, or administrative
@@ -72,15 +73,30 @@ EVENT_BLACKLIST_PATTERNS <- c(
              function(p) grepl(p, ev, ignore.case = TRUE), logical(1)))
 }
 
-# Find the label row for a drug name, checking generic_name AND brand_name
-# (both lowercased). The signals' rxnorm_name often carries brand names
-# (e.g. "ampyra") while the label cache's generic_name is the active
-# ingredient ("dalfampridine"); matching brand_name catches those.
-.find_label_row <- function(lbl, drug) {
+# Resolve a raw drug name to an active-substance name using the DiAna
+# dictionary (fusarolimichele/DiAna_package; ~348k raw-name -> substance
+# pairs). Returns NA if unknown. Lookup is O(1) via match().
+.diana_substance <- function(drug, diana) {
+  if (is.null(diana) || nrow(diana) == 0) return(NA_character_)
+  diana$substance[match(tolower(drug), diana$drugname)][1]
+}
+
+# Find the label row(s) for a drug name. Tries in order:
+#   1. direct match on generic_name or brand_name (covers drugs without
+#      a DiAna entry and rare/newly-approved products)
+#   2. substance match: resolve the drug to its DiAna substance, then
+#      filter labels by their precomputed substance column
+# `lbl` is expected to carry a `substance` column (populated by the
+# labels() reactive via DiAna when the dictionary is loaded).
+.find_label_row <- function(lbl, drug, diana = NULL) {
   drug_lc <- tolower(drug)
-  lbl[tolower(lbl$generic_name) == drug_lc |
-        (!is.na(lbl$brand_name) & tolower(lbl$brand_name) == drug_lc),
-      , drop = FALSE]
+  direct <- lbl[tolower(lbl$generic_name) == drug_lc |
+                  (!is.na(lbl$brand_name) & tolower(lbl$brand_name) == drug_lc),
+                , drop = FALSE]
+  if (nrow(direct) > 0) return(direct)
+  substance <- .diana_substance(drug, diana)
+  if (is.na(substance) || !"substance" %in% names(lbl)) return(direct)
+  lbl[!is.na(lbl$substance) & lbl$substance == substance, , drop = FALSE]
 }
 
 #' @export
@@ -138,10 +154,29 @@ server <- function(id) {
       open_dataset(SIGNALS_PATH)
     })
 
-    # FDA label cache (one-time load per session)
+    # DiAna drug-name dictionary (raw-name -> active substance).
+    # One-time load per session. ~348k rows, ~7 MB parquet.
+    diana_dict <- reactive({
+      if (!file.exists(DIANA_PATH)) return(NULL)
+      read_parquet(DIANA_PATH)
+    })
+
+    # FDA label cache, augmented with a `substance` column derived from
+    # DiAna: tries generic_name first, then brand_name. Lets both the
+    # pair_stats novelty check and the KNOWN/NOVEL badge match signal
+    # drugs to labels via DiAna-canonical substance, not raw text.
     labels <- reactive({
       if (!file.exists(LABELS_PATH)) return(NULL)
-      read_parquet(LABELS_PATH)
+      lbl <- read_parquet(LABELS_PATH)
+      diana <- diana_dict()
+      if (!is.null(diana) && nrow(diana) > 0) {
+        gn_sub <- diana$substance[match(tolower(lbl$generic_name), diana$drugname)]
+        bn_sub <- diana$substance[match(tolower(lbl$brand_name), diana$drugname)]
+        lbl$substance <- ifelse(!is.na(gn_sub), gn_sub, bn_sub)
+      } else {
+        lbl$substance <- NA_character_
+      }
+      lbl
     })
 
     # One-shot aggregation of every (drug, event) pair flagged by >=2 of 4
@@ -182,8 +217,9 @@ server <- function(id) {
         ps$novel <- NA
       } else {
         has_indications <- "indications_and_usage" %in% names(lbl)
+        diana <- diana_dict()
         ps$novel <- mapply(function(drug, event) {
-          row <- .find_label_row(lbl, drug)
+          row <- .find_label_row(lbl, drug, diana)
           if (nrow(row) == 0 || is.na(row$set_id[1])) return(NA)
           sections <- c(
             row$boxed_warning[1], row$contraindications[1],
@@ -274,7 +310,7 @@ server <- function(id) {
         return(tags$div(class = "alert alert-secondary small py-2",
                         "Label cross-reference not loaded."))
       }
-      row <- .find_label_row(lbl_df, sp$drug)
+      row <- .find_label_row(lbl_df, sp$drug, diana_dict())
       if (nrow(row) == 0 || is.na(row$set_id[1])) {
         return(tags$div(class = "alert alert-secondary small py-2",
                         tags$strong("No label cached"),
