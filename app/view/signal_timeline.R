@@ -237,6 +237,17 @@ server <- function(id) {
       } else {
         ps$first_approval <- as.Date(NA)
       }
+      # Weber-effect adjustment: shrink peak_eb05 for recently marketed
+      # drugs. New drugs with tiny background counts produce inflated EB05;
+      # this post-hoc correction (eb05 * (1 - 0.6 * exp(-years_on_market)))
+      # pulls the score down ~36% at 6 months, ~22% at 1 year, ~0% at 5+.
+      # Drugs without a known approval date get no adjustment (assumed
+      # established). See NOVELTY_FILTER_ROADMAP.md for the proper adaptive
+      # prior path (pipeline-side).
+      today <- Sys.Date()
+      years_on_market <- as.numeric(today - ps$first_approval) / 365.25
+      shrink <- 1 - 0.6 * exp(-pmax(years_on_market, 0))
+      ps$adj_eb05 <- ifelse(is.na(shrink), ps$peak_eb05, ps$peak_eb05 * shrink)
       # Novelty column: TRUE (novel), FALSE (known), NA (no cached label)
       if (is.null(lbl)) {
         ps$novel <- NA
@@ -274,18 +285,20 @@ server <- function(id) {
         Drug = ps$rxnorm_name,
         Event = ps$outcome_name,
         `Peak EB05` = round(ps$peak_eb05, 2),
-        Methods = as.integer(ps$n_methods_max),
+        `Adj EB05` = round(ps$adj_eb05, 2),
         Quarters = as.integer(ps$quarters_flagged),
-        `First signal` = ps$first_signal,
-        `Latest signal` = ps$latest_signal,
-        `First approved` = as.character(ps$first_approval),
+        `First FDA Report` = ps$first_signal,
+        `Latest Report` = ps$latest_signal,
+        `Approval Year` = ifelse(is.na(ps$first_approval), "",
+                                 format(ps$first_approval, "%Y")),
         Novel = ifelse(is.na(ps$novel), "?", ifelse(ps$novel, "novel", "known")),
         check.names = FALSE
       )
       # Default column search: Novel = "novel" and Quarters >= 3. Column
-      # indices (0-based): 0 Drug, 1 Event, 2 Peak EB05, 3 Methods,
-      # 4 Quarters, 5 First signal, 6 Latest signal, 7 First approved,
-      # 8 Novel.
+      # indices (0-based): 0 Drug, 1 Event, 2 Peak EB05, 3 Adj EB05,
+      # 4 Quarters, 5 First FDA Report, 6 Latest Report, 7 Approval Year,
+      # 8 Novel. Default sort: Adj EB05 desc (Weber-corrected strongest
+      # first).
       datatable(
         display,
         selection = list(mode = "single", selected = .default_row(ps)),
@@ -294,7 +307,7 @@ server <- function(id) {
         options = list(
           pageLength = 25,
           lengthMenu = list(c(10, 25, 50, 100), c("10", "25", "50", "100")),
-          order = list(list(2, "desc")),
+          order = list(list(3, "desc")),
           searchHighlight = TRUE,
           searchCols = list(
             NULL, NULL, NULL, NULL,
