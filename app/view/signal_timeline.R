@@ -18,6 +18,58 @@ box::use(
 SIGNALS_PATH <- "data/signals.parquet"
 LABELS_PATH <- "data/fda_labels.parquet"
 
+# ---- Novelty filter support ----
+# Events that are medication errors, product-quality issues, or administrative
+# reporting artefacts — not drug pharmacology. Dropped from "novel" candidates
+# because calling them novel safety signals misrepresents the signal.
+EVENT_BLACKLIST_EXACT <- c(
+  "Intercepted drug dispensing error",
+  "Drug dispensing error",
+  "Medication error",
+  "Wrong drug administered",
+  "Product substitution issue",
+  "Incorrect route of product administration",
+  "Product dose omission issue",
+  "Product quality issue",
+  "Product solubility abnormal",
+  "Product packaging issue",
+  "Contamination product physical issue",
+  "Expired product administered",
+  "Accidental exposure to product",
+  "Accidental overdose",
+  "Off label use",
+  "Drug abuse",
+  "Drug dependence"
+)
+EVENT_BLACKLIST_PATTERNS <- c(
+  "dispensing error", "administration error", "product.*error",
+  "product use issue", "drug use error", "medication interaction"
+)
+
+.EVENT_STOP_WORDS <- c(
+  "of", "the", "and", "in", "to", "a", "an", "on", "at", "with", "by",
+  "for", "as", "is", "be", "from", "or", "under"
+)
+
+.event_in_label <- function(event, label_text) {
+  ev <- tolower(event)
+  lbl <- tolower(label_text)
+  if (identical(lbl, "")) return(FALSE)
+  if (grepl(ev, lbl, fixed = TRUE)) return(TRUE)
+  words <- unlist(strsplit(ev, "[[:space:][:punct:]]+"))
+  words <- words[nchar(words) >= 3 & !(words %in% .EVENT_STOP_WORDS)]
+  if (length(words) == 0) return(FALSE)
+  matched <- sum(vapply(words, function(w) grepl(w, lbl, fixed = TRUE), logical(1)))
+  matched / length(words) >= 0.7
+}
+
+.event_is_blacklisted <- function(event) {
+  if (event %in% EVENT_BLACKLIST_EXACT) return(TRUE)
+  ev <- tolower(event)
+  any(vapply(EVENT_BLACKLIST_PATTERNS,
+             function(p) grepl(p, ev, ignore.case = TRUE), logical(1)))
+}
+
 #' @export
 ui <- function(id) {
   ns <- NS(id)
@@ -37,12 +89,16 @@ ui <- function(id) {
     ),
     fluidRow(
       column(12,
-        h4("Top 20 novel signals — not in FDA label"),
-        p("Computed across all pairs flagged by \u22653 of 4 methods, ranked by ",
-          "peak EWMA-smoothed EB05. \u201CNovel\u201D means the event is not ",
-          "mentioned in the drug\u2019s current FDA label (limited to drugs ",
-          "with cached openFDA label data). These are hypotheses worth ",
-          "investigating, not confirmed associations."),
+        h4("Top 20 pairs not in cached FDA label"),
+        p("Pairs flagged by \u22653 of 4 methods, ranked by peak EWMA-smoothed ",
+          "EB05. \u201CNot in cached label\u201D means the event (or \u226570% of ",
+          "its words) is absent from the drug\u2019s boxed warning, ",
+          "contraindications, warnings, or adverse-reactions sections in our ",
+          "openFDA label cache. Medication-error and product-quality PTs are ",
+          "filtered out. This is a weak novelty proxy: class effects, ",
+          "MedDRA-hierarchy synonyms, and indication confounders are NOT ",
+          "excluded here \u2014 treat rows as hypotheses to investigate, not ",
+          "confirmed novel associations."),
         tableOutput(ns("top_novel_table")),
         hr()
       )
@@ -182,18 +238,22 @@ server <- function(id) {
           .groups = "drop"
         ) %>%
         arrange(desc(.data$peak_eb05)) %>%
-        utils::head(200) %>%
+        utils::head(400) %>%
         collect()
+      # Drop medication-error / admin / product-quality PTs — not drug effects
+      top <- top[!vapply(top$outcome_name, .event_is_blacklisted, logical(1)), , drop = FALSE]
+      # Label check: novel if event (or >=70% of its words) is absent from any
+      # label section we cache. Requires a cached label; unknowns drop out.
       top$is_novel <- mapply(function(drug, event) {
         row <- lbl[lbl$generic_name == tolower(drug), , drop = FALSE]
         if (nrow(row) == 0 || is.na(row$set_id[1])) return(NA)
-        ev <- tolower(event)
         sections <- c(
           row$boxed_warning[1], row$contraindications[1],
           row$warnings_and_cautions[1], row$warnings[1], row$adverse_reactions[1]
         )
         sections[is.na(sections)] <- ""
-        !any(grepl(ev, tolower(sections), fixed = TRUE))
+        combined <- paste(sections, collapse = " \n ")
+        !.event_in_label(event, combined)
       }, top$rxnorm_name, top$outcome_name)
       top <- top[!is.na(top$is_novel) & top$is_novel, , drop = FALSE]
       top$is_novel <- NULL
@@ -246,7 +306,7 @@ server <- function(id) {
         `Warnings/Precautions` = paste(nz(row$warnings_and_cautions[1]), nz(row$warnings[1])),
         `Adverse Reactions` = nz(row$adverse_reactions[1])
       )
-      hits <- names(sections)[vapply(sections, function(s) grepl(ev, tolower(s), fixed = TRUE), logical(1))]
+      hits <- names(sections)[vapply(sections, function(s) .event_in_label(input$event, s), logical(1))]
       if (length(hits) == 0) {
         tags$div(class = "alert alert-danger small py-2",
                  tags$strong("NOVEL"),
