@@ -22,6 +22,7 @@ LABELS_PATH <- "data/fda_labels.parquet"
 DIANA_PATH <- "data/diana_dictionary.parquet"
 FIRST_APPROVAL_PATH <- "data/first_approval.parquet"
 MEDDRA_PATH <- "data/meddra_hierarchy.parquet"
+ATC_PATH <- "data/atc_classes.parquet"
 
 # ---- Novelty filter support ----
 # Events that are medication errors, product-quality issues, or administrative
@@ -196,6 +197,15 @@ server <- function(id) {
       df
     })
 
+    # ATC class binder from DiAna OSF: substance -> atc_code +
+    # atc_class4 (chemical subgroup, e.g. "Proton pump inhibitors").
+    # Used for the Class column in the DT; enables class-effect
+    # visual scanning.
+    atc_classes <- reactive({
+      if (!file.exists(ATC_PATH)) return(NULL)
+      read_parquet(ATC_PATH)
+    })
+
     # FDA label cache, augmented with a `substance` column derived from
     # DiAna: tries generic_name first, then brand_name. Lets both the
     # pair_stats novelty check and the KNOWN/NOVEL badge match signal
@@ -275,6 +285,13 @@ server <- function(id) {
       years_on_market <- as.numeric(today - ps$first_approval) / 365.25
       shrink <- 1 - 0.6 * exp(-pmax(years_on_market, 0))
       ps$adj_eb05 <- ifelse(is.na(shrink), ps$peak_eb05, ps$peak_eb05 * shrink)
+      # ATC class4 (chemical subgroup) via DiAna substance
+      atc <- atc_classes()
+      if (!is.null(atc) && nrow(atc) > 0) {
+        ps$atc_class <- atc$atc_class4[match(ps$substance, atc$substance)]
+      } else {
+        ps$atc_class <- NA_character_
+      }
       # Novelty column: TRUE (novel), FALSE (known), NA (no cached label)
       if (is.null(lbl)) {
         ps$novel <- NA
@@ -328,14 +345,14 @@ server <- function(id) {
         `Latest Report` = ps$latest_signal,
         `Approval Year` = ifelse(is.na(ps$first_approval), "",
                                  format(ps$first_approval, "%Y")),
+        Class = ifelse(is.na(ps$atc_class), "", ps$atc_class),
         Novel = ifelse(is.na(ps$novel), "?", ifelse(ps$novel, "novel", "known")),
         check.names = FALSE
       )
       # Default column search: Novel = "novel" and Quarters >= 3. Column
       # indices (0-based): 0 Drug, 1 Event, 2 Peak EB05, 3 Adj EB05,
       # 4 Quarters, 5 First FDA Report, 6 Latest Report, 7 Approval Year,
-      # 8 Novel. Default sort: Adj EB05 desc (Weber-corrected strongest
-      # first).
+      # 8 Class, 9 Novel. Default sort: Adj EB05 desc.
       datatable(
         display,
         selection = list(mode = "single", selected = .default_row(ps)),
@@ -349,7 +366,7 @@ server <- function(id) {
           searchCols = list(
             NULL, NULL, NULL, NULL,
             list(search = "3 ... 9999"),
-            NULL, NULL, NULL,
+            NULL, NULL, NULL, NULL,
             list(search = "novel")
           ),
           columnDefs = list(list(className = "dt-right", targets = c(2, 3, 4)))
