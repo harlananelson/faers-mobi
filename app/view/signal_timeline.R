@@ -345,6 +345,8 @@ server <- function(id) {
         `Latest Report` = ps$latest_signal,
         `Approval Year` = ifelse(is.na(ps$first_approval), "",
                                  format(ps$first_approval, "%Y")),
+        `Yrs on Market` = ifelse(is.na(ps$first_approval), NA_integer_,
+                                  as.integer(floor(years_on_market))),
         Class = ifelse(is.na(ps$atc_class), "", ps$atc_class),
         Novel = ifelse(is.na(ps$novel), "?", ifelse(ps$novel, "novel", "known")),
         check.names = FALSE
@@ -352,24 +354,28 @@ server <- function(id) {
       # Default column search: Novel = "novel" and Quarters >= 3. Column
       # indices (0-based): 0 Drug, 1 Event, 2 Peak EB05, 3 Adj EB05,
       # 4 Quarters, 5 First FDA Report, 6 Latest Report, 7 Approval Year,
-      # 8 Class, 9 Novel. Default sort: Adj EB05 desc.
+      # 8 Yrs on Market, 9 Class, 10 Novel. Default sort: Adj EB05 desc.
       datatable(
         display,
         selection = list(mode = "single", selected = .default_row(ps)),
         rownames = FALSE,
         filter = "top",
+        extensions = "Buttons",
         options = list(
           pageLength = 25,
           lengthMenu = list(c(10, 25, 50, 100), c("10", "25", "50", "100")),
           order = list(list(3, "desc")),
           searchHighlight = TRUE,
+          dom = 'Blfrtip',
+          buttons = list(list(extend = "csv", text = "Download CSV",
+                              filename = "signals")),
           searchCols = list(
             NULL, NULL, NULL, NULL,
             list(search = "3 ... 9999"),
-            NULL, NULL, NULL, NULL,
+            NULL, NULL, NULL, NULL, NULL,
             list(search = "novel")
           ),
-          columnDefs = list(list(className = "dt-right", targets = c(2, 3, 4)))
+          columnDefs = list(list(className = "dt-right", targets = c(2, 3, 4, 8)))
         )
       ) |>
         formatStyle(
