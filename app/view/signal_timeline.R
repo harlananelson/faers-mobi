@@ -20,6 +20,7 @@ box::use(
 SIGNALS_PATH <- "data/signals.parquet"
 LABELS_PATH <- "data/fda_labels.parquet"
 DIANA_PATH <- "data/diana_dictionary.parquet"
+FIRST_APPROVAL_PATH <- "data/first_approval.parquet"
 
 # ---- Novelty filter support ----
 # Events that are medication errors, product-quality issues, or administrative
@@ -161,6 +162,13 @@ server <- function(id) {
       read_parquet(DIANA_PATH)
     })
 
+    # FDA Orange Book first-approval-for-marketing dates, keyed by active
+    # substance. ~2100 single-ingredient approved drugs.
+    first_approval <- reactive({
+      if (!file.exists(FIRST_APPROVAL_PATH)) return(NULL)
+      read_parquet(FIRST_APPROVAL_PATH)
+    })
+
     # FDA label cache, augmented with a `substance` column derived from
     # DiAna: tries generic_name first, then brand_name. Lets both the
     # pair_stats novelty check and the KNOWN/NOVEL badge match signal
@@ -212,12 +220,28 @@ server <- function(id) {
         collect()
       # Drop medication-error / admin / product-quality PTs — not drug effects
       ps <- ps[!vapply(ps$outcome_name, .event_is_blacklisted, logical(1)), , drop = FALSE]
+      # Attach DiAna-resolved substance and first-approval date per drug
+      diana <- diana_dict()
+      appr <- first_approval()
+      if (!is.null(diana) && nrow(diana) > 0) {
+        ps$substance <- diana$substance[match(tolower(ps$rxnorm_name), diana$drugname)]
+      } else {
+        ps$substance <- NA_character_
+      }
+      if (!is.null(appr) && nrow(appr) > 0) {
+        ps$first_approval <- appr$first_approval[match(ps$substance, appr$substance)]
+        need_fallback <- is.na(ps$first_approval)
+        ps$first_approval[need_fallback] <-
+          appr$first_approval[match(tolower(ps$rxnorm_name[need_fallback]),
+                                    appr$substance)]
+      } else {
+        ps$first_approval <- as.Date(NA)
+      }
       # Novelty column: TRUE (novel), FALSE (known), NA (no cached label)
       if (is.null(lbl)) {
         ps$novel <- NA
       } else {
         has_indications <- "indications_and_usage" %in% names(lbl)
-        diana <- diana_dict()
         ps$novel <- mapply(function(drug, event) {
           row <- .find_label_row(lbl, drug, diana)
           if (nrow(row) == 0 || is.na(row$set_id[1])) return(NA)
@@ -254,12 +278,14 @@ server <- function(id) {
         Quarters = as.integer(ps$quarters_flagged),
         `First signal` = ps$first_signal,
         `Latest signal` = ps$latest_signal,
+        `First approved` = as.character(ps$first_approval),
         Novel = ifelse(is.na(ps$novel), "?", ifelse(ps$novel, "novel", "known")),
         check.names = FALSE
       )
       # Default column search: Novel = "novel" and Quarters >= 3. Column
       # indices (0-based): 0 Drug, 1 Event, 2 Peak EB05, 3 Methods,
-      # 4 Quarters, 5 First signal, 6 Latest signal, 7 Novel.
+      # 4 Quarters, 5 First signal, 6 Latest signal, 7 First approved,
+      # 8 Novel.
       datatable(
         display,
         selection = list(mode = "single", selected = .default_row(ps)),
@@ -273,7 +299,7 @@ server <- function(id) {
           searchCols = list(
             NULL, NULL, NULL, NULL,
             list(search = "3 ... 9999"),
-            NULL, NULL,
+            NULL, NULL, NULL,
             list(search = "novel")
           ),
           columnDefs = list(list(className = "dt-right", targets = c(2, 3, 4)))
