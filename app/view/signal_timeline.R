@@ -244,6 +244,9 @@ server <- function(id) {
       top <- top[!vapply(top$outcome_name, .event_is_blacklisted, logical(1)), , drop = FALSE]
       # Label check: novel if event (or >=70% of its words) is absent from any
       # label section we cache. Requires a cached label; unknowns drop out.
+      # If indications_and_usage is available (augmented cache), it's included
+      # so indication confounders (drug -> its own indication) are filtered.
+      has_indications <- "indications_and_usage" %in% names(lbl)
       top$is_novel <- mapply(function(drug, event) {
         row <- lbl[lbl$generic_name == tolower(drug), , drop = FALSE]
         if (nrow(row) == 0 || is.na(row$set_id[1])) return(NA)
@@ -251,6 +254,7 @@ server <- function(id) {
           row$boxed_warning[1], row$contraindications[1],
           row$warnings_and_cautions[1], row$warnings[1], row$adverse_reactions[1]
         )
+        if (has_indications) sections <- c(sections, row$indications_and_usage[1])
         sections[is.na(sections)] <- ""
         combined <- paste(sections, collapse = " \n ")
         !.event_in_label(event, combined)
