@@ -294,7 +294,7 @@ server <- function(id) {
         options = list(
           pageLength = 25,
           lengthMenu = list(c(10, 25, 50, 100), c("10", "25", "50", "100")),
-          order = list(list(5, "desc")),
+          order = list(list(2, "desc")),
           searchHighlight = TRUE,
           searchCols = list(
             NULL, NULL, NULL, NULL,
