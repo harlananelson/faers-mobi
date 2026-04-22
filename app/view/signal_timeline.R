@@ -350,8 +350,8 @@ server <- function(id) {
       # established). See NOVELTY_FILTER_ROADMAP.md for the proper adaptive
       # prior path (pipeline-side).
       today <- Sys.Date()
-      years_on_market <- as.numeric(today - ps$first_approval) / 365.25
-      shrink <- 1 - 0.6 * exp(-pmax(years_on_market, 0))
+      ps$years_on_market <- as.numeric(today - ps$first_approval) / 365.25
+      shrink <- 1 - 0.6 * exp(-pmax(ps$years_on_market, 0))
       ps$adj_eb05 <- ifelse(is.na(shrink), ps$peak_eb05, ps$peak_eb05 * shrink)
       # ATC class4 (chemical subgroup) via DiAna substance
       atc <- atc_classes()
@@ -427,7 +427,7 @@ server <- function(id) {
         `Approval Year` = ifelse(is.na(ps$first_approval), "",
                                  format(ps$first_approval, "%Y")),
         `Yrs on Market` = ifelse(is.na(ps$first_approval), NA_integer_,
-                                  as.integer(floor(years_on_market))),
+                                  as.integer(floor(ps$years_on_market))),
         Class = ifelse(is.na(ps$atc_class), "", ps$atc_class),
         `Class co-flags` = as.integer(ps$class_co_flags),
         Novel = ifelse(is.na(ps$novel), "?", ifelse(ps$novel, "novel", "known")),
