@@ -79,16 +79,40 @@ EVENT_BLACKLIST_PATTERNS <- c(
   "for", "as", "is", "be", "from", "or", "under"
 )
 
-.event_in_label <- function(event, label_text) {
-  ev <- tolower(event)
-  lbl <- tolower(label_text)
+# Normalize British <-> American medical spellings so that a US label
+# that says "anemia / leukemia / tumor" matches a MedDRA PT written
+# in British spelling ("anaemia / leukaemia / tumour") and vice-versa.
+.normalize_spelling <- function(x) {
+  x <- gsub("aemia",   "emia",   x, fixed = TRUE)
+  x <- gsub("oedema",  "edema",  x, fixed = TRUE)
+  x <- gsub("oesoph",  "esoph",  x, fixed = TRUE)
+  x <- gsub("haema",   "hema",   x, fixed = TRUE)
+  x <- gsub("haemo",   "hemo",   x, fixed = TRUE)
+  x <- gsub("tumour",  "tumor",  x, fixed = TRUE)
+  x <- gsub("leukaem", "leukem", x, fixed = TRUE)
+  x <- gsub("paediat", "pediat", x, fixed = TRUE)
+  x <- gsub("diarrhoea", "diarrhea", x, fixed = TRUE)
+  x
+}
+
+# Fuzzy match of an event string against arbitrary label text.
+# Case-insensitive; strips stop-words and short tokens; matches when
+# either (a) the event is a direct substring of the label or (b) at
+# least `threshold` fraction of event's non-trivial words appear
+# somewhere in the label. Spelling normalized on both sides before
+# comparison. Threshold default 0.7 for direct event matches;
+# callers can pass 0.6 for MedDRA-synonym matches where some semantic
+# slack is appropriate.
+.event_in_label <- function(event, label_text, threshold = 0.7) {
+  ev <- .normalize_spelling(tolower(event))
+  lbl <- .normalize_spelling(tolower(label_text))
   if (identical(lbl, "")) return(FALSE)
   if (grepl(ev, lbl, fixed = TRUE)) return(TRUE)
   words <- unlist(strsplit(ev, "[[:space:][:punct:]]+"))
   words <- words[nchar(words) >= 3 & !(words %in% .EVENT_STOP_WORDS)]
   if (length(words) == 0) return(FALSE)
   matched <- sum(vapply(words, function(w) grepl(w, lbl, fixed = TRUE), logical(1)))
-  matched / length(words) >= 0.7
+  matched / length(words) >= threshold
 }
 
 .event_is_blacklisted <- function(event) {
@@ -104,13 +128,16 @@ EVENT_BLACKLIST_PATTERNS <- c(
 # the same concept with non-MedDRA wording (e.g. PT "Spinal cord
 # infarction" vs label "spinal cord ischaemia").
 .event_in_label_expanded <- function(event, label_text, meddra_row = NULL) {
-  if (.event_in_label(event, label_text)) return(TRUE)
+  if (.event_in_label(event, label_text, threshold = 0.7)) return(TRUE)
   if (is.null(meddra_row) || nrow(meddra_row) == 0) return(FALSE)
   syns <- meddra_row$syns_list[[1]]
   syns <- syns[nchar(syns) >= 5]
   if (length(syns) == 0) return(FALSE)
-  lbl <- tolower(label_text)
-  any(vapply(syns, function(s) grepl(s, lbl, fixed = TRUE), logical(1)))
+  # Each synonym gets a slightly looser word-level match (0.6) against
+  # the label. Synonyms are already semantically equivalent to the
+  # event, so giving them 10 percentage points more slack is sound.
+  any(vapply(syns, function(s) .event_in_label(s, label_text, threshold = 0.6),
+             logical(1)))
 }
 
 # Resolve a raw drug name to an active-substance name using the DiAna
