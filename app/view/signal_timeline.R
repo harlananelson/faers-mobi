@@ -243,6 +243,11 @@ ui <- function(id) {
     fluidRow(
       column(12,
         h4("Signals by drug and event"),
+        tags$div(class = "alert alert-info small py-2",
+          tags$strong("Note:"),
+          " the first load takes 10-20 seconds while the app computes label ",
+          "matches, MedDRA synonyms, and class stats for the top 2000 pairs. ",
+          "Subsequent interactions are fast."),
         p(
           "The top 2000 (drug, event) pairs by peak EB05, among those flagged ",
           "by \u22652 of 4 disproportionality methods (GPS/EBGM, PRR, ROR, IC). ",
@@ -272,6 +277,7 @@ ui <- function(id) {
       column(12, dataTableOutput(ns("signal_table")))
     ),
     fluidRow(column(12, uiOutput(ns("known_badge")))),
+    fluidRow(column(12, uiOutput(ns("event_description")))),
     fluidRow(column(12, plotOutput(ns("timeline"), height = "500px"))),
     fluidRow(
       column(12,
@@ -482,12 +488,13 @@ server <- function(id) {
       # Novelty column: TRUE (novel), FALSE (known), NA (no cached label)
       if (is.null(lbl)) {
         ps$novel <- NA
+        ps$treats <- NA
       } else {
         has_indications <- "indications_and_usage" %in% names(lbl)
         mh <- meddra()
-        ps$novel <- mapply(function(drug, event) {
+        results <- mapply(function(drug, event) {
           row <- .find_label_row(lbl, drug, diana)
-          if (nrow(row) == 0 || is.na(row$set_id[1])) return(NA)
+          if (nrow(row) == 0 || is.na(row$set_id[1])) return(c(NA, NA))
           sections <- c(
             row$boxed_warning[1], row$contraindications[1],
             row$warnings_and_cautions[1], row$warnings[1], row$adverse_reactions[1]
@@ -496,8 +503,16 @@ server <- function(id) {
           sections[is.na(sections)] <- ""
           combined <- paste(sections, collapse = " \n ")
           mrow <- if (!is.null(mh)) mh[mh$pt == event, , drop = FALSE] else NULL
-          !.event_in_label_expanded(event, combined, mrow)
+          novel <- !.event_in_label_expanded(event, combined, mrow)
+          treats <- FALSE
+          if (has_indications) {
+            ind <- if (is.na(row$indications_and_usage[1])) "" else row$indications_and_usage[1]
+            treats <- .event_in_label_expanded(event, ind, mrow)
+          }
+          c(novel, treats)
         }, ps$rxnorm_name, ps$outcome_name)
+        ps$novel <- as.logical(results[1, ])
+        ps$treats <- as.logical(results[2, ])
       }
       ps
     })
@@ -537,6 +552,7 @@ server <- function(id) {
                                   as.integer(floor(ps$years_on_market))),
         Class = ifelse(is.na(ps$atc_class), "", ps$atc_class),
         `Class co-flags` = as.integer(ps$class_co_flags),
+        Treats = ifelse(is.na(ps$treats), "", ifelse(ps$treats, "yes", "")),
         Triage = ps$triage,
         Novel = ifelse(is.na(ps$novel), "?", ifelse(ps$novel, "novel", "known")),
         check.names = FALSE
@@ -544,8 +560,8 @@ server <- function(id) {
       # Column indices (0-based): 0 Watch, 1 Drug, 2 Event, 3 Peak EB05,
       # 4 Adj EB05, 5 Quarters, 6 First FDA Report, 7 Latest Report,
       # 8 Approval Year, 9 Yrs on Market, 10 Class, 11 Class co-flags,
-      # 12 Triage, 13 Novel. Default sort: Adj EB05 desc (col 4).
-      # Default filter: Novel = "novel" and Quarters >= 3.
+      # 12 Treats, 13 Triage, 14 Novel. Default sort: Adj EB05 desc
+      # (col 4). Default filter: Novel = "novel" and Quarters >= 3.
       datatable(
         display,
         selection = list(mode = "single", selected = .default_row(ps)),
@@ -563,7 +579,7 @@ server <- function(id) {
           searchCols = list(
             NULL, NULL, NULL, NULL, NULL,
             list(search = "3 ... 9999"),
-            NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+            NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
             list(search = "novel")
           ),
           columnDefs = list(list(className = "dt-right",
@@ -640,6 +656,22 @@ server <- function(id) {
       }
     })
 
+    output$event_description <- renderUI({
+      sp <- selected_pair()
+      req(sp$event)
+      mh <- meddra()
+      if (is.null(mh) || !"definition" %in% names(mh)) return(NULL)
+      row <- mh[mh$pt == sp$event, , drop = FALSE]
+      if (nrow(row) == 0 || is.na(row$definition[1]) || nchar(row$definition[1]) == 0) {
+        return(NULL)
+      }
+      tags$div(
+        class = "alert alert-secondary small py-2",
+        tags$strong("About the event: "),
+        tags$em(sp$event), " \u2014 ", row$definition[1]
+      )
+    })
+
     output$timeline <- renderPlot({
       ts <- selected_ts()
       sp <- selected_pair()
@@ -684,19 +716,20 @@ server <- function(id) {
         x1 = ts$quarter_num, y1 = ts$eb95,
         col = "steelblue", lwd = 2
       )
+      # Connect EB50 point estimates with a straight line (no EWMA
+      # smoothing — the points are already Bayes-shrunk posterior
+      # medians, so smoothing them is redundant).
+      graphics::lines(ts$quarter_num, ts$eb50, col = "gray40", lwd = 1, lty = 1)
       color <- ifelse(ts$signal_tier == "signal", "firebrick",
                      ifelse(ts$signal_tier == "watch", "orange2", "steelblue"))
       graphics::points(ts$quarter_num, ts$eb50, pch = 19, col = color)
-      if ("ewma_eb05" %in% names(ts)) {
-        graphics::lines(ts$quarter_num, ts$ewma_eb05, col = "darkgreen", lty = 1, lwd = 2)
-      }
 
       graphics::legend(
         "topleft", bty = "n", cex = 0.9,
-        legend = c("95% CI", "Point (EB50)", "Smoothed EB05", "Null (1)", "Signal (2)"),
-        col = c("steelblue", "firebrick", "darkgreen", "gray60", "firebrick"),
-        lty = c(1, NA, 1, 2, 3), lwd = c(2, NA, 2, 1, 1),
-        pch = c(NA, 19, NA, NA, NA)
+        legend = c("95% CI", "Point (EB50)", "Null (1)", "Signal (2)"),
+        col = c("steelblue", "firebrick", "gray60", "firebrick"),
+        lty = c(1, NA, 2, 3), lwd = c(2, NA, 1, 1),
+        pch = c(NA, 19, NA, NA)
       )
     })
   })
