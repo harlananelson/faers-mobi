@@ -26,6 +26,7 @@ ATC_PATH <- "data/atc_classes.parquet"
 BLACKLIST_EXACT_PATH <- "data/event_blacklist_exact.csv"
 BLACKLIST_PATTERN_PATH <- "data/event_blacklist_patterns.csv"
 TRIAGE_PATH <- "data/signal_triage.csv"
+WATCHLIST_PATH <- "data/signal_watchlist.csv"
 
 # Load a control file's single column. Returns character(0) when the
 # file is missing or the column doesn't exist, so the rest of the
@@ -346,6 +347,20 @@ server <- function(id) {
       df
     })
 
+    # Watchlist control file: pairs to track over time regardless of
+    # triage status. Schema: drug, event, reason, added_by, added_date.
+    watchlist <- reactive({
+      if (!file.exists(WATCHLIST_PATH)) return(NULL)
+      df <- tryCatch(
+        utils::read.csv(WATCHLIST_PATH, stringsAsFactors = FALSE, encoding = "UTF-8"),
+        error = function(e) NULL
+      )
+      if (is.null(df) || nrow(df) == 0) return(NULL)
+      df$drug_lc <- tolower(trimws(df$drug))
+      df$event_lc <- tolower(trimws(df$event))
+      df
+    })
+
     # FDA label cache, augmented with a `substance` column derived from
     # DiAna: tries generic_name first, then brand_name. Lets both the
     # pair_stats novelty check and the KNOWN/NOVEL badge match signal
@@ -447,14 +462,22 @@ server <- function(id) {
       }
       # Join manual-triage classifications. Match on lowercased drug+event.
       tri <- triage()
+      key <- paste(tolower(ps$rxnorm_name), tolower(ps$outcome_name),
+                   sep = "\x1f")
       if (!is.null(tri)) {
-        key <- paste(tolower(ps$rxnorm_name), tolower(ps$outcome_name),
-                     sep = "\x1f")
         tri_key <- paste(tri$drug_lc, tri$event_lc, sep = "\x1f")
         idx <- match(key, tri_key)
         ps$triage <- ifelse(is.na(idx), "", tri$classification[idx])
       } else {
         ps$triage <- ""
+      }
+      # Join watchlist. Watched pairs are marked with a star.
+      wl <- watchlist()
+      if (!is.null(wl)) {
+        wl_key <- paste(wl$drug_lc, wl$event_lc, sep = "\x1f")
+        ps$watch <- ifelse(key %in% wl_key, "\u2605", "")
+      } else {
+        ps$watch <- ""
       }
       # Novelty column: TRUE (novel), FALSE (known), NA (no cached label)
       if (is.null(lbl)) {
@@ -500,6 +523,7 @@ server <- function(id) {
         ps$rxnorm_name
       )
       display <- data.frame(
+        Watch = ps$watch,
         Drug = drug_col,
         Event = ps$outcome_name,
         `Peak EB05` = round(ps$peak_eb05, 2),
@@ -517,11 +541,11 @@ server <- function(id) {
         Novel = ifelse(is.na(ps$novel), "?", ifelse(ps$novel, "novel", "known")),
         check.names = FALSE
       )
-      # Default column search: Novel = "novel" and Quarters >= 3. Column
-      # indices (0-based): 0 Drug, 1 Event, 2 Peak EB05, 3 Adj EB05,
-      # 4 Quarters, 5 First FDA Report, 6 Latest Report, 7 Approval Year,
-      # 8 Yrs on Market, 9 Class, 10 Class co-flags, 11 Triage, 12 Novel.
-      # Default sort: Adj EB05 desc.
+      # Column indices (0-based): 0 Watch, 1 Drug, 2 Event, 3 Peak EB05,
+      # 4 Adj EB05, 5 Quarters, 6 First FDA Report, 7 Latest Report,
+      # 8 Approval Year, 9 Yrs on Market, 10 Class, 11 Class co-flags,
+      # 12 Triage, 13 Novel. Default sort: Adj EB05 desc (col 4).
+      # Default filter: Novel = "novel" and Quarters >= 3.
       datatable(
         display,
         selection = list(mode = "single", selected = .default_row(ps)),
@@ -531,19 +555,19 @@ server <- function(id) {
         options = list(
           pageLength = 25,
           lengthMenu = list(c(10, 25, 50, 100), c("10", "25", "50", "100")),
-          order = list(list(3, "desc")),
+          order = list(list(4, "desc")),
           searchHighlight = TRUE,
           dom = 'Blfrtip',
           buttons = list(list(extend = "csv", text = "Download CSV",
                               filename = "signals")),
           searchCols = list(
-            NULL, NULL, NULL, NULL,
+            NULL, NULL, NULL, NULL, NULL,
             list(search = "3 ... 9999"),
             NULL, NULL, NULL, NULL, NULL, NULL, NULL,
             list(search = "novel")
           ),
           columnDefs = list(list(className = "dt-right",
-                                 targets = c(2, 3, 4, 8, 10)))
+                                 targets = c(3, 4, 5, 9, 11)))
         )
       ) |>
         formatStyle(
