@@ -23,12 +23,31 @@ DIANA_PATH <- "data/diana_dictionary.parquet"
 FIRST_APPROVAL_PATH <- "data/first_approval.parquet"
 MEDDRA_PATH <- "data/meddra_hierarchy.parquet"
 ATC_PATH <- "data/atc_classes.parquet"
+BLACKLIST_EXACT_PATH <- "data/event_blacklist_exact.csv"
+BLACKLIST_PATTERN_PATH <- "data/event_blacklist_patterns.csv"
+TRIAGE_PATH <- "data/signal_triage.csv"
+
+# Load a control file's single column. Returns character(0) when the
+# file is missing or the column doesn't exist, so the rest of the
+# pipeline is unaffected by a broken/missing control file.
+.load_control_column <- function(path, col) {
+  if (!file.exists(path)) return(character(0))
+  df <- tryCatch(
+    utils::read.csv(path, stringsAsFactors = FALSE, encoding = "UTF-8"),
+    error = function(e) NULL
+  )
+  if (is.null(df) || !col %in% names(df)) return(character(0))
+  vals <- as.character(df[[col]])
+  vals[nchar(vals) > 0]
+}
 
 # ---- Novelty filter support ----
 # Events that are medication errors, product-quality issues, or administrative
 # reporting artefacts — not drug pharmacology. Dropped from "novel" candidates
 # because calling them novel safety signals misrepresents the signal.
-EVENT_BLACKLIST_EXACT <- c(
+# The control files at data/event_blacklist_*.csv are authoritative; the
+# in-file defaults below are a fallback when those files are missing.
+.FALLBACK_BLACKLIST_EXACT <- c(
   "Intercepted drug dispensing error",
   "Drug dispensing error",
   "Medication error",
@@ -58,9 +77,34 @@ EVENT_BLACKLIST_EXACT <- c(
   "Product deposit",
   "Labelled drug-disease interaction medication error",
   "Product physical issue",
-  "Injection site extravasation"
+  "Injection site extravasation",
+  # Added 2026-04-22 from Grok top-100 blacklist review
+  # (AI/plans/blacklist.md). Clear-noise PTs only.
+  "Out of specification product use",
+  "Medication residue present",
+  "Counterfeit product administered",
+  "Reaction to excipient",
+  "Food interaction",
+  "Papillary deformity",
+  "Foreign body",
+  "Foreign body in respiratory tract",
+  "Removal of foreign body",
+  "Contrast media reaction",
+  "Contrast media toxicity",
+  "Fibrin",
+  "Shunt stenosis",
+  "Shunt occlusion",
+  "Retinal exudates",
+  "Enterobacter test positive",
+  "Burkholderia test positive",
+  "Burkholderia infection",
+  "Culture positive",
+  "Sputum culture positive",
+  "Infantile spitting up",
+  "Pathogen resistance",
+  "Expulsion of medication"
 )
-EVENT_BLACKLIST_PATTERNS <- c(
+.FALLBACK_BLACKLIST_PATTERNS <- c(
   "dispensing error", "administration error", "product.*error",
   "product use issue", "drug use error", "medication interaction",
   # Broaden: any PT starting with "product " is SOC Product issues
@@ -71,8 +115,20 @@ EVENT_BLACKLIST_PATTERNS <- c(
   "drug-disease interaction",
   # Drug preparation / storage / administration issues
   "drug preparation error",
-  "product storage error"
+  "product storage error",
+  # 2026-04-22 additions from Grok top-100 review
+  "test positive$",
+  "antigen increased$",
+  "^foreign body",
+  "^contrast media"
 )
+
+# Load the canonical blacklists from the control files. Falls back to the
+# hardcoded defaults if the CSVs aren't present on disk.
+.loaded_exact <- .load_control_column(BLACKLIST_EXACT_PATH, "pt")
+.loaded_patt  <- .load_control_column(BLACKLIST_PATTERN_PATH, "pattern")
+EVENT_BLACKLIST_EXACT <- if (length(.loaded_exact) > 0) .loaded_exact else .FALLBACK_BLACKLIST_EXACT
+EVENT_BLACKLIST_PATTERNS <- if (length(.loaded_patt) > 0) .loaded_patt else .FALLBACK_BLACKLIST_PATTERNS
 
 .EVENT_STOP_WORDS <- c(
   "of", "the", "and", "in", "to", "a", "an", "on", "at", "with", "by",
@@ -274,6 +330,22 @@ server <- function(id) {
       read_parquet(ATC_PATH)
     })
 
+    # Manual-triage control file: curated classifications for
+    # specific (drug, event) pairs with explanations. Edit the CSV to
+    # add / revise entries; changes take effect on next app restart.
+    # Schema: drug, event, classification, explanation, reviewer, date.
+    triage <- reactive({
+      if (!file.exists(TRIAGE_PATH)) return(NULL)
+      df <- tryCatch(
+        utils::read.csv(TRIAGE_PATH, stringsAsFactors = FALSE, encoding = "UTF-8"),
+        error = function(e) NULL
+      )
+      if (is.null(df) || nrow(df) == 0) return(NULL)
+      df$drug_lc <- tolower(trimws(df$drug))
+      df$event_lc <- tolower(trimws(df$event))
+      df
+    })
+
     # FDA label cache, augmented with a `substance` column derived from
     # DiAna: tries generic_name first, then brand_name. Lets both the
     # pair_stats novelty check and the KNOWN/NOVEL badge match signal
@@ -373,6 +445,17 @@ server <- function(id) {
         ps$class_co_flags[has_class] <-
           as.integer(counts[match(key[has_class], names(counts))])
       }
+      # Join manual-triage classifications. Match on lowercased drug+event.
+      tri <- triage()
+      if (!is.null(tri)) {
+        key <- paste(tolower(ps$rxnorm_name), tolower(ps$outcome_name),
+                     sep = "\x1f")
+        tri_key <- paste(tri$drug_lc, tri$event_lc, sep = "\x1f")
+        idx <- match(key, tri_key)
+        ps$triage <- ifelse(is.na(idx), "", tri$classification[idx])
+      } else {
+        ps$triage <- ""
+      }
       # Novelty column: TRUE (novel), FALSE (known), NA (no cached label)
       if (is.null(lbl)) {
         ps$novel <- NA
@@ -430,13 +513,14 @@ server <- function(id) {
                                   as.integer(floor(ps$years_on_market))),
         Class = ifelse(is.na(ps$atc_class), "", ps$atc_class),
         `Class co-flags` = as.integer(ps$class_co_flags),
+        Triage = ps$triage,
         Novel = ifelse(is.na(ps$novel), "?", ifelse(ps$novel, "novel", "known")),
         check.names = FALSE
       )
       # Default column search: Novel = "novel" and Quarters >= 3. Column
       # indices (0-based): 0 Drug, 1 Event, 2 Peak EB05, 3 Adj EB05,
       # 4 Quarters, 5 First FDA Report, 6 Latest Report, 7 Approval Year,
-      # 8 Yrs on Market, 9 Class, 10 Class co-flags, 11 Novel.
+      # 8 Yrs on Market, 9 Class, 10 Class co-flags, 11 Triage, 12 Novel.
       # Default sort: Adj EB05 desc.
       datatable(
         display,
@@ -455,7 +539,7 @@ server <- function(id) {
           searchCols = list(
             NULL, NULL, NULL, NULL,
             list(search = "3 ... 9999"),
-            NULL, NULL, NULL, NULL, NULL, NULL,
+            NULL, NULL, NULL, NULL, NULL, NULL, NULL,
             list(search = "novel")
           ),
           columnDefs = list(list(className = "dt-right",
