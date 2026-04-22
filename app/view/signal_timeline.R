@@ -83,6 +83,7 @@ EVENT_BLACKLIST_PATTERNS <- c(
 # that says "anemia / leukemia / tumor" matches a MedDRA PT written
 # in British spelling ("anaemia / leukaemia / tumour") and vice-versa.
 .normalize_spelling <- function(x) {
+  # British -> American medical spellings (one-way, American canonical).
   x <- gsub("aemia",   "emia",   x, fixed = TRUE)
   x <- gsub("oedema",  "edema",  x, fixed = TRUE)
   x <- gsub("oesoph",  "esoph",  x, fixed = TRUE)
@@ -92,6 +93,18 @@ EVENT_BLACKLIST_PATTERNS <- c(
   x <- gsub("leukaem", "leukem", x, fixed = TRUE)
   x <- gsub("paediat", "pediat", x, fixed = TRUE)
   x <- gsub("diarrhoea", "diarrhea", x, fixed = TRUE)
+  x <- gsub("colour",  "color",  x, fixed = TRUE)  # discolouration / colour
+  x <- gsub("fibres",  "fibers", x, fixed = TRUE)
+  x <- gsub("fibre",   "fiber",  x, fixed = TRUE)
+  x <- gsub("centre",  "center", x, fixed = TRUE)
+  x <- gsub("metre",   "meter",  x, fixed = TRUE)
+  # Curated clinical synonyms where UMLS atoms often miss the pairing.
+  # Each entry picks a canonical form and rewrites to it on both sides.
+  x <- gsub("adrenocortical", "adrenal",     x, fixed = TRUE)
+  x <- gsub("lymphoblastic",  "lymphocytic", x, fixed = TRUE)  # MedDRA canonical
+  x <- gsub("relapsed",       "recurrent",   x, fixed = TRUE)
+  x <- gsub("refractory",     "recurrent",   x, fixed = TRUE)
+  x <- gsub("staining",       "discoloration", x, fixed = TRUE) # tooth/skin staining
   x
 }
 
