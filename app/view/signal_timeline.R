@@ -354,6 +354,19 @@ server <- function(id) {
       } else {
         ps$atc_class <- NA_character_
       }
+      # Class co-flags: for each (class, event), count how many distinct
+      # drugs in the same ATC4 class also flag this event (among top-2000).
+      # A high number means "class effect" (likely already labeled at the
+      # class level even if missing from a specific drug's text);
+      # 1 means drug-specific.
+      has_class <- !is.na(ps$atc_class) & !is.na(ps$outcome_name)
+      ps$class_co_flags <- 1L
+      if (any(has_class)) {
+        key <- paste(ps$atc_class, ps$outcome_name, sep = "\x1f")
+        counts <- table(key[has_class])
+        ps$class_co_flags[has_class] <-
+          as.integer(counts[match(key[has_class], names(counts))])
+      }
       # Novelty column: TRUE (novel), FALSE (known), NA (no cached label)
       if (is.null(lbl)) {
         ps$novel <- NA
@@ -410,13 +423,15 @@ server <- function(id) {
         `Yrs on Market` = ifelse(is.na(ps$first_approval), NA_integer_,
                                   as.integer(floor(years_on_market))),
         Class = ifelse(is.na(ps$atc_class), "", ps$atc_class),
+        `Class co-flags` = as.integer(ps$class_co_flags),
         Novel = ifelse(is.na(ps$novel), "?", ifelse(ps$novel, "novel", "known")),
         check.names = FALSE
       )
       # Default column search: Novel = "novel" and Quarters >= 3. Column
       # indices (0-based): 0 Drug, 1 Event, 2 Peak EB05, 3 Adj EB05,
       # 4 Quarters, 5 First FDA Report, 6 Latest Report, 7 Approval Year,
-      # 8 Yrs on Market, 9 Class, 10 Novel. Default sort: Adj EB05 desc.
+      # 8 Yrs on Market, 9 Class, 10 Class co-flags, 11 Novel.
+      # Default sort: Adj EB05 desc.
       datatable(
         display,
         selection = list(mode = "single", selected = .default_row(ps)),
@@ -434,10 +449,11 @@ server <- function(id) {
           searchCols = list(
             NULL, NULL, NULL, NULL,
             list(search = "3 ... 9999"),
-            NULL, NULL, NULL, NULL, NULL,
+            NULL, NULL, NULL, NULL, NULL, NULL,
             list(search = "novel")
           ),
-          columnDefs = list(list(className = "dt-right", targets = c(2, 3, 4, 8)))
+          columnDefs = list(list(className = "dt-right",
+                                 targets = c(2, 3, 4, 8, 10)))
         )
       ) |>
         formatStyle(
